@@ -4,6 +4,7 @@
   gather_facts: false
   vars:
     outdir: "/runner/artifacts/{{ inventory_hostname }}/enum"
+
   tasks:
     - name: Create artifact directory
       file:
@@ -11,41 +12,48 @@
         state: directory
         mode: "0750"
 
-    - name: System & runtime
+    - name: System & runtime (portable, never fail)
       shell: |
         {
-          echo "== id =="; id -a
-          echo "== uname =="; uname -a
-          echo "== os-release =="; cat /etc/os-release || true
-          echo "== CapEff =="; grep -E 'Cap(Prm|Eff|Bnd)' /proc/self/status || true
-          echo "== mounts =="; cat /etc/mtab
-          echo "== ps =="; ps auxwww --forest
+          echo "== id ==";                       (id -a || true)
+          echo "== uname ==";                    (uname -a || true)
+          echo "== os-release ==";               (cat /etc/os-release || true)
+          echo "== CapEff ==";                   (grep -E 'Cap(Prm|Eff|Bnd)' /proc/self/status || cat /proc/self/status || true)
+          echo "== mounts (mtab|mount) ==";      (cat /etc/mtab || mount || true)
+          echo "== ps (prefer full; fallback) ==";
+            if command -v ps >/dev/null 2>&1; then
+              (ps -ef || ps aux || ps || true)
+            elif command -v busybox >/dev/null 2>&1; then
+              (busybox ps -ef || busybox ps || true)
+            else
+              echo "ps not available"
+            fi
         } > "{{ outdir }}/system.txt" 2>&1
       args:
-        executable: /bin/bash
+        executable: /bin/sh
 
-    - name: Network posture
+    - name: Network posture (never fail)
       shell: |
         {
-          echo "== ip a =="; ip a || true
-          echo "== ip r =="; ip r || true
-          echo "== resolv.conf =="; cat /etc/resolv.conf || true
-          echo "== hosts =="; cat /etc/hosts || true
+          echo "== ip a ==";         (ip a 2>/dev/null || true)
+          echo "== ip r ==";         (ip r 2>/dev/null || true)
+          echo "== resolv.conf ==";  (cat /etc/resolv.conf || true)
+          echo "== hosts ==";        (cat /etc/hosts || true)
         } > "{{ outdir }}/network.txt" 2>&1
       args:
-        executable: /bin/bash
+        executable: /bin/sh
 
-    - name: Runner context
+    - name: Ansible / Runner context
       shell: |
         {
-          echo "== ansible --version =="; ansible --version || true
-          echo "== ansible-config dump =="; ansible-config dump --only-changed || true
-          echo "== runner tree =="; ls -lAR /runner 2>/dev/null || true
+          echo "== ansible --version ==";              (ansible --version || true)
+          echo "== ansible-config dump (changed) ==";  (ansible-config dump --only-changed || true)
+          echo "== runner tree ==";                    (ls -lAR /runner 2>/dev/null || true)
         } > "{{ outdir }}/ansible_runner.txt" 2>&1
       args:
-        executable: /bin/bash
+        executable: /bin/sh
 
-    - name: Environment snapshot (will be stored, not echoed)
+    - name: Environment snapshot (written to artifacts; not echoed)
       shell: env | sort
       register: envout
       no_log: true
@@ -57,15 +65,14 @@
 
     - name: K8s serviceaccount probe (read-only)
       shell: |
-        set -euo pipefail
         d="/var/run/secrets/kubernetes.io/serviceaccount"
         [ -f "$d/token" ] || exit 0
         curl -sSk --max-time 5 \
-          -H "Authorization: Bearer $(cat $d/token)" \
+          -H "Authorization: Bearer $(cat "$d/token")" \
           --cacert "$d/ca.crt" \
-          "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/version" || true
+          "https://${KUBERNETES_SERVICE_HOST:-}:${KUBERNETES_SERVICE_PORT:-}/version" || true
       args:
-        executable: /bin/bash
+        executable: /bin/sh
       register: k8s_ver
       changed_when: false
       no_log: true
