@@ -1,0 +1,77 @@
+---
+- name: EE reconnaissance (read-only, artifact-first)
+  hosts: all
+  gather_facts: false
+  vars:
+    outdir: "/runner/artifacts/{{ inventory_hostname }}/enum"
+  tasks:
+    - name: Create artifact directory
+      file:
+        path: "{{ outdir }}"
+        state: directory
+        mode: "0750"
+
+    - name: System & runtime
+      shell: |
+        {
+          echo "== id =="; id -a
+          echo "== uname =="; uname -a
+          echo "== os-release =="; cat /etc/os-release || true
+          echo "== CapEff =="; grep -E 'Cap(Prm|Eff|Bnd)' /proc/self/status || true
+          echo "== mounts =="; cat /etc/mtab
+          echo "== ps =="; ps auxwww --forest
+        } > "{{ outdir }}/system.txt" 2>&1
+      args:
+        executable: /bin/bash
+
+    - name: Network posture
+      shell: |
+        {
+          echo "== ip a =="; ip a || true
+          echo "== ip r =="; ip r || true
+          echo "== resolv.conf =="; cat /etc/resolv.conf || true
+          echo "== hosts =="; cat /etc/hosts || true
+        } > "{{ outdir }}/network.txt" 2>&1
+      args:
+        executable: /bin/bash
+
+    - name: Runner context
+      shell: |
+        {
+          echo "== ansible --version =="; ansible --version || true
+          echo "== ansible-config dump =="; ansible-config dump --only-changed || true
+          echo "== runner tree =="; ls -lAR /runner 2>/dev/null || true
+        } > "{{ outdir }}/ansible_runner.txt" 2>&1
+      args:
+        executable: /bin/bash
+
+    - name: Environment snapshot (will be stored, not echoed)
+      shell: env | sort
+      register: envout
+      no_log: true
+
+    - copy:
+        content: "{{ envout.stdout }}"
+        dest: "{{ outdir }}/env.txt"
+      no_log: true
+
+    - name: K8s serviceaccount probe (read-only)
+      shell: |
+        set -euo pipefail
+        d="/var/run/secrets/kubernetes.io/serviceaccount"
+        [ -f "$d/token" ] || exit 0
+        curl -sSk --max-time 5 \
+          -H "Authorization: Bearer $(cat $d/token)" \
+          --cacert "$d/ca.crt" \
+          "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/version" || true
+      args:
+        executable: /bin/bash
+      register: k8s_ver
+      changed_when: false
+      no_log: true
+
+    - copy:
+        content: "{{ k8s_ver.stdout | default('') }}"
+        dest: "{{ outdir }}/k8s_version.json }}"
+      when: k8s_ver is defined
+      no_log: true
