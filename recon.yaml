@@ -1,79 +1,101 @@
----
-- name: EE reconnaissance (read-only, artifact-first)
-  hosts: all
-  gather_facts: false
-  vars:
-    want_truncate: 8000        # keep JSON manageable
-  tasks:
-    - name: System & runtime (portable)
-      shell: |
-        {
-          echo "== id ==";                       (id -a || true)
-          echo "== uname ==";                    (uname -a || true)
-          echo "== os-release ==";               (cat /etc/os-release || true)
-          echo "== CapEff ==";                   (grep -E 'Cap(Prm|Eff|Bnd)' /proc/self/status || cat /proc/self/status || true)
-          echo "== mounts (mtab|mount) ==";      (cat /etc/mtab || mount || true)
-          echo "== ps (best effort) ==";
-            if command -v ps >/dev/null 2>&1; then
-              (ps -ef || ps aux || ps || true)
-            elif command -v busybox >/dev/null 2>&1; then
-              (busybox ps -ef || busybox ps || true)
-            else
-              echo "ps not available"
-            fi
-        }
-      args: { executable: /bin/sh }
-      register: sys_rt
-      changed_when: false
+# --- Filesystem writability & sticky dirs
+- name: Check common paths for write access
+  shell: |
+    for d in / /tmp /var/tmp /runner /runner/project /etc /root ; do
+      [ -d "$d" ] || continue
+      printf "%-20s " "$d"
+      (touch "$d"/.__wtest$$ 2>/dev/null && echo "writable" && rm -f "$d"/.__wtest$$) || echo "read-only"
+    done
+  args: { executable: /bin/sh }
+  register: writechk
+  changed_when: false
 
-    - name: Network posture
-      shell: |
-        {
-          echo "== ip a ==";         (ip a 2>/dev/null || true)
-          echo "== ip r ==";         (ip r 2>/dev/null || true)
-          echo "== resolv.conf ==";  (cat /etc/resolv.conf || true)
-          echo "== hosts ==";        (cat /etc/hosts || true)
-        }
-      args: { executable: /bin/sh }
-      register: netinfo
-      changed_when: false
+- set_stats:
+    data:
+      write_access: "{{ writechk.stdout }}"
+    aggregate: true
 
-    - name: Ansible / Runner context
-      shell: |
-        {
-          echo "== ansible --version ==";              (ansible --version || true)
-          echo "== ansible-config dump (changed) ==";  (ansible-config dump --only-changed || true)
-          echo "== runner tree (top-level) ==";        (ls -lA /runner 2>/dev/null || true)
-        }
-      args: { executable: /bin/sh }
-      register: runner_ctx
-      changed_when: false
+# --- Process list without `ps` (via /proc)
+- name: Enumerate PIDs via /proc (command lines)
+  shell: |
+    for p in /proc/[0-9]*; do
+      pid=$(basename "$p")
+      cmd=$(tr -d '\0' < "$p/cmdline" 2>/dev/null || true)
+      [ -z "$cmd" ] && cmd="[$(cat $p/comm 2>/dev/null || echo '?')]"
+      echo "$pid $cmd"
+    done | sort -n
+  args: { executable: /bin/sh }
+  register: proclite
+  changed_when: false
 
-    - name: Env snapshot (not echoed)
-      shell: env | sort
-      register: envout
-      no_log: true
-      changed_when: false
+- set_stats:
+    data:
+      procs_lite: "{{ (proclite.stdout | default(''))[:8000] }}"
+    aggregate: true
 
-    - name: K8s /version probe (read-only)
-      shell: |
-        d="/var/run/secrets/kubernetes.io/serviceaccount"
-        [ -f "$d/token" ] || exit 0
-        curl -sSk --max-time 5 \
-          -H "Authorization: Bearer $(cat "$d/token")" \
-          --cacert "$d/ca.crt" \
-          "https://${KUBERNETES_SERVICE_HOST:-}:${KUBERNETES_SERVICE_PORT:-}/version" || true
-      args: { executable: /bin/sh }
-      register: k8s_ver
-      changed_when: false
-      no_log: true
+# --- Open sockets without `ss`/`netstat`
+- name: List listening TCP sockets (/proc/net/tcp)
+  shell: |
+    awk 'NR>1 {print $2, $4}' /proc/net/tcp 2>/dev/null | sed 's/:/ /' || true
+  args: { executable: /bin/sh }
+  register: tcpl
+  changed_when: false
+- set_stats:
+    data:
+      tcp_listeners_raw: "{{ tcpl.stdout }}"
+    aggregate: true
 
-    - name: Publish into Job Artifacts (truncated for UI)
-      set_stats:
-        data:
-          system_txt: "{{ (sys_rt.stdout | default(''))[:want_truncate] }}"
-          network_txt: "{{ (netinfo.stdout | default(''))[:want_truncate] }}"
-          ansible_runner_txt: "{{ (runner_ctx.stdout | default(''))[:want_truncate] }}"
-          env_txt_b64: "{{ (envout.stdout | default('')) | b64encode }}"
-          k8s_version_json: "{{ (k8s_ver.stdout | default(''))[:want_truncate] }}"
-        aggregate: true
+# --- Explicit SA mount and RBAC sanity
+- name: Check for Kubernetes serviceaccount files
+  shell: |
+    d="/var/run/secrets/kubernetes.io/serviceaccount"
+    [ -f "$d/token" ] && echo "token=present" || echo "token=absent"
+    [ -f "$d/namespace" ] && { printf "ns="; cat "$d/namespace"; } || echo "ns=?"
+    [ -f "$d/ca.crt" ] && echo "ca=present" || echo "ca=absent"
+  args: { executable: /bin/sh }
+  register: sa2
+  no_log: true
+  changed_when: false
+- set_stats:
+    data:
+      sa_mount_info: "{{ sa2.stdout }}"
+    aggregate: true
+
+# --- Try a namespaced, read-only discovery if token is present
+- name: K8s namespaced GETs (pods, services) if SA exists
+  shell: |
+    d="/var/run/secrets/kubernetes.io/serviceaccount"
+    [ -f "$d/token" ] || exit 0
+    NS=$(cat "$d/namespace")
+    base="https://${KUBERNETES_SERVICE_HOST:-}:${KUBERNETES_SERVICE_PORT:-}"
+    hdr="-H Authorization: Bearer $(cat $d/token)"
+    ca="--cacert $d/ca.crt"
+    echo "GET $base/api/v1/namespaces/$NS/pods"
+    curl -sSk --max-time 5 $hdr $ca "$base/api/v1/namespaces/$NS/pods" | head -c 8000 || true
+    echo
+    echo "GET $base/api/v1/namespaces/$NS/services"
+    curl -sSk --max-time 5 $hdr $ca "$base/api/v1/namespaces/$NS/services" | head -c 8000 || true
+  args: { executable: /bin/sh }
+  register: k8s_ns
+  no_log: true
+  changed_when: false
+
+- set_stats:
+    data:
+      k8s_ns_probe: "{{ k8s_ns.stdout }}"
+    aggregate: true
+
+# --- project / runner env listings (content-free, safe)
+- name: List runner env, inventory, and project trees (top 2 levels)
+  shell: |
+    for d in /runner/env /runner/inventory /runner/project ; do
+      [ -d "$d" ] && { echo "== $d =="; find "$d" -maxdepth 2 -type f -printf '%M %u:%g %p\n' ; }
+    done
+  args: { executable: /bin/sh }
+  register: trees
+  changed_when: false
+
+- set_stats:
+    data:
+      runner_trees: "{{ (trees.stdout | default(''))[:8000] }}"
+    aggregate: true
